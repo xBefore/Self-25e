@@ -224,6 +224,13 @@ class VisualProcessor:
         self.last_circle3 = []
         self.updated      = False
 
+        # --- Search/Track 状态机 ---
+        self.track_state  = 'SEARCH'   # 'SEARCH' | 'TRACK'
+        self.last_bbox    = None       # [x, y, w, h] 缓存的 ROI (AI 坐标系)
+        self.miss_count   = 0
+        self.ROI_MARGIN   = 20         # Track 模式下 ROI 外扩像素
+        self.MAX_MISS     = 2          # 连续丢失帧数阈值, 超则降级 SEARCH
+
         # --- UART ---
         self._uart = None
         try:
@@ -260,9 +267,10 @@ class VisualProcessor:
 
     def run(self):
         """
-        执行一次完整管线。
-        返回 dict: {err_center, center_pos, screen_center, circle3_points, updated}
-        无有效检测时 updated=False, err_center=[0,0]。
+        Search/Track 状态机:
+          SEARCH → 每帧 YOLO, 检测到目标后切 TRACK
+          TRACK  → 跳过 YOLO, 用缓存 ROI+margin 做局部传统CV追踪
+                   连续 miss >= MAX_MISS → 降级回 SEARCH
         """
         self.updated = False
         self._debug_time("start")
@@ -276,18 +284,37 @@ class VisualProcessor:
             return self._no_result()
         self._debug_time("cam_read")
 
-        # 2. AI检测黑框
-        found, bbox, img_ai = self._detect_border(img)
-        if not found:
-            self._display(img)
-            return self._no_result()
-        self._debug_time("ai_detect")
+        # 准备 AI 尺寸小图 (两种状态都需要, TRACK 用于裁剪, SEARCH 用于 YOLO)
+        img_ai = img.resize(self._ai_w, self._ai_h) if HIRES_MODE else img
 
-        # 3. 裁剪ROI + 二值化
+        # ============================================================
+        # 分支A: SEARCH — 全帧 YOLO 检测
+        # ============================================================
+        if self.track_state == 'SEARCH':
+            found, bbox, _ = self._detect_border(img)
+            if not found or bbox is None:
+                self._display(img)
+                return self._no_result()
+            self._debug_time("ai_detect")
+            self.last_bbox = [bbox[0], bbox[1], bbox[2], bbox[3]]
+            self.miss_count = 0
+            self.track_state = 'TRACK'
+
+        # ============================================================
+        # 分支B: TRACK — 跳过 YOLO, 缓存 ROI + margin
+        # ============================================================
+        else:  # self.track_state == 'TRACK'
+            self._debug_time("ai_detect(skip)")
+
+        # 两种状态的共用 bbox (SEARCH 刚写入, TRACK 复用缓存)
+        bbox = self.last_bbox
+
+        # 3. 裁剪 ROI + 二值化 (SEARCH: YOLO bbox, TRACK: 缓存 bbox + margin)
         crop_ai, crop_ai_rect = self._crop(img_ai, bbox)
         binary = self._threshold(crop_ai)
         if binary is None:
             self._display(img)
+            self._track_miss()
             return self._no_result()
         self._debug_time("threshold")
 
@@ -295,8 +322,17 @@ class VisualProcessor:
         corners_ai = self._find_corners(binary)
         if corners_ai is None:
             self._display(img)
+            self._track_miss()
             return self._no_result()
         self._debug_time("find_corners")
+
+        # TRACK 模式下角点找到: 更新缓存 bbox (在 AI 坐标系)
+        if self.track_state == 'TRACK':
+            corners_ai_global = corners_ai.copy()
+            corners_ai_global[:, 0] += crop_ai_rect[0]
+            corners_ai_global[:, 1] += crop_ai_rect[1]
+            self.last_bbox = self._corners_to_bbox(corners_ai_global)
+            self.miss_count = 0
 
         # 5. 角点映射到摄像头坐标系
         corners_cam = self._map_to_camera(corners_ai, crop_ai_rect)
@@ -307,6 +343,7 @@ class VisualProcessor:
         M, M_inv, img_std_cv = self._perspective(corners_cam, img_cv)
         if M is None or img_std_cv is None:
             self._display(img)
+            self._track_miss()
             return self._no_result()
         self._debug_time("perspective")
 
@@ -323,15 +360,7 @@ class VisualProcessor:
         self._debug_time("inverse")
 
         # 9. 卡尔曼滤波: 量测更新 → 预测 T+Δt (已禁用)
-        center_for_err = center_cam  # 直接用原始量测
-        # if self._kf is not None:
-        #     now = time.ticks_ms()
-        #     dt = (now - self._kf_t) / 1000.0 if self._kf_t else 0
-        #     self._kf.update(center_cam, min(dt, 0.5))  # 限dt防止跳变
-        #     predicted = self._kf.predict_ahead(KF_PREDICT_DT)
-        #     center_for_err = (predicted[0, 0], predicted[1, 0])
-        #     self._kf_t = now
-        #     self._debug_time("kalman")
+        center_for_err = center_cam
 
         # 10. 计算误差
         err_x = center_for_err[0] - self._screen_center[0] + webui.get('ofs_x', 0)
@@ -342,7 +371,7 @@ class VisualProcessor:
         self.updated = True
         self._debug_time("error")
 
-        # 11. 触摸检测 + 显示 (调参模式: 触摸/调试/参数屏; 竞赛模式: 全跳过)
+        # 11. 触摸检测 + 显示
         self._check_touch()
         if webui.get('tuning_mode', True):
             if not self._show_params:
@@ -350,7 +379,7 @@ class VisualProcessor:
                                         center_cam, center_for_err, circle3_cam)
         self._display(img)
 
-        # 12. 推送给 WebUI 实时状态
+        # 12. WebUI 实时状态
         webui.update_stats(
             fps=time.fps(),
             updated=self.updated,
@@ -415,18 +444,13 @@ class VisualProcessor:
         return crop, [x1, y1, w_crop, h_crop]
 
     def _threshold(self, crop_ai):
-        """自适应二值化 + 洪水填充,返回numpy二值图"""
+        """大津法全局二值化 + 洪水填充,返回numpy二值图 (比自适应快~3x)"""
         gray = crop_ai.to_format(image.Format.FMT_GRAYSCALE)
         gray_cv = image.image2cv(gray, ensure_bgr=False, copy=False)
 
-        # 自适应二值化
-        binary = cv2.adaptiveThreshold(
-            gray_cv, 255,
-            cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV,
-            webui.get('adp_block', ADAPTIVE_BLOCK_DEF),
-            webui.get('adp_c', ADAPTIVE_C_DEF),
-        )
+        # 大津法 (OTSU): 自动计算全局最优阈值, 无需手动调参
+        _, binary = cv2.threshold(gray_cv, 0, 255,
+                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         if binary is None or binary.size == 0:
             return None
 
@@ -475,6 +499,23 @@ class VisualProcessor:
             return None
 
         return ordered
+
+    def _track_miss(self):
+        """TRACK 模式丢失目标: 累加计数器, 超阈值切回 SEARCH"""
+        if self.track_state != 'TRACK':
+            return
+        self.miss_count += 1
+        if self.miss_count >= self.MAX_MISS:
+            self.track_state = 'SEARCH'
+            self.miss_count = 0
+
+    def _corners_to_bbox(self, corners):
+        """从 4 角点反算外接矩形 (用于 Track 模式更新缓存 ROI)"""
+        x_min = int(np.min(corners[:, 0]))
+        y_min = int(np.min(corners[:, 1]))
+        w = int(np.max(corners[:, 0])) - x_min
+        h = int(np.max(corners[:, 1])) - y_min
+        return [x_min, y_min, max(w, 1), max(h, 1)]
 
     def _map_to_camera(self, corners_ai, crop_rect):
         """角点从AI裁剪图坐标 → 摄像头坐标"""
@@ -773,11 +814,11 @@ class VisualProcessor:
             pass
 
     def _display(self, img):
-        """统一的显示入口, 自动处理参数二级界面。非调参模式下直接跳过"""
-        if not webui.get('tuning_mode', True):
-            return
+        """统一的显示入口。调参模式=画面+调试, 竞赛模式=跳过(零开销)"""
         if self._disp is None:
             return
+        if not webui.get('tuning_mode', True):
+            return  # 不推帧 → 显示控制器复用帧缓冲, CPU 零开销
         if self._show_params:
             self._draw_params_screen(img)
         self._disp.show(img, fit=image.Fit.FIT_CONTAIN)
