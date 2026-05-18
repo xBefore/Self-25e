@@ -6,7 +6,7 @@
 API:  https://wiki.sipeed.com/maixpy/api/
 """
 
-from maix import camera, display, image, nn, app, time
+from maix import camera, display, image, nn, app, time, touchscreen
 from maix.peripheral import uart as uart_mod
 import cv2
 import numpy as np
@@ -80,6 +80,7 @@ DEBUG_DRAW_ERR_MSG  = False     # 画FPS/误差文字(~7ms开销)
 DEBUG_DRAW_CIRCLE3  = False     # 画circle3轨迹点(慢)
 DEBUG_PRINT_TIME    = False     # 打印各阶段耗时
 DEBUG_PRINT_ERR     = False     # 打印每帧误差
+SHOW_PARAMS         = False     # True=显示参数二级界面(触摸右上角切换)
 
 # # ============================================================
 # # 卡尔曼滤波 (常速模型, 4状态: x, y, vx, vy)
@@ -234,6 +235,11 @@ class VisualProcessor:
         # --- 一阶低通 ---
         self._lpf_err = None  # [err_x, err_y] 滤波后的误差
 
+        # --- 二级参数界面 ---
+        self._show_params = SHOW_PARAMS
+        self._ts = touchscreen.TouchScreen() if ENABLE_DISPLAY else None
+        self._ts_touched = False
+
     def __del__(self):
         if self._uart and self._uart.is_open():
             self._uart.close()
@@ -255,6 +261,9 @@ class VisualProcessor:
         self.updated = False
         self._debug_time("start")
 
+        # 0. 触摸检测
+        self._check_touch()
+
         # 1. 读帧
         img = self._cam.read()
         if img is None:
@@ -264,7 +273,7 @@ class VisualProcessor:
         # 2. AI检测黑框
         found, bbox, img_ai = self._detect_border(img)
         if not found:
-            self._show(img)
+            self._display(img)
             return self._no_result()
         self._debug_time("ai_detect")
 
@@ -272,14 +281,14 @@ class VisualProcessor:
         crop_ai, crop_ai_rect = self._crop(img_ai, bbox)
         binary = self._threshold(crop_ai)
         if binary is None:
-            self._show(img)
+            self._display(img)
             return self._no_result()
         self._debug_time("threshold")
 
         # 4. 找四角点
         corners_ai = self._find_corners(binary)
         if corners_ai is None:
-            self._show(img)
+            self._display(img)
             return self._no_result()
         self._debug_time("find_corners")
 
@@ -291,7 +300,7 @@ class VisualProcessor:
         img_cv = image.image2cv(img, ensure_bgr=True, copy=False)
         M, M_inv, img_std_cv = self._perspective(corners_cam, img_cv)
         if M is None or img_std_cv is None:
-            self._show(img)
+            self._display(img)
             return self._no_result()
         self._debug_time("perspective")
 
@@ -327,10 +336,14 @@ class VisualProcessor:
         self.updated = True
         self._debug_time("error")
 
-        # 11. 显示
-        show_img = self._draw_debug(img, img_ai, bbox, corners_cam,
+        # 11. 触摸检测(切换参数界面)
+        self._check_touch()
+
+        # 12. 显示
+        if not self._show_params:
+            img = self._draw_debug(img, img_ai, bbox, corners_cam,
                                     center_cam, center_for_err, circle3_cam)
-        self._show(show_img)
+        self._display(img)
 
         return {
             "err_center":      self.err_center,
@@ -647,6 +660,96 @@ class VisualProcessor:
                               color=image.COLOR_GREEN)
 
         return canvas
+
+    def _draw_params_screen(self, img):
+        """二级界面: 黑底白字显示当前所有参数值"""
+        w, h = img.width(), img.height()
+
+        # 直接填充黑色背景 (不用RGBA叠加,避免格式不匹配)
+        img.draw_rect(0, 0, w, h, image.COLOR_BLACK, thickness=-1)
+
+        y = 12
+        left_x = 14
+        val_x = 170
+        row_h = 19
+        c_head  = image.COLOR_YELLOW
+        c_label = image.COLOR_WHITE
+        c_value = image.Color(120, 255, 0)   # 亮绿
+        c_dim   = image.Color(130, 130, 130) # 灰色
+
+        def row(label, value, unit=''):
+            nonlocal y
+            img.draw_string(left_x, y, label, scale=1.0, color=c_label)
+            txt = f'{value}{unit}'
+            tw = image.string_size(txt, scale=1.0)[0]
+            img.draw_string(val_x - tw, y, txt, scale=1.0, color=c_value)
+            y += row_h
+
+        # ISP
+        img.draw_string(left_x, y, '-- ISP --', scale=1.0, color=c_head)
+        y += row_h + 2
+        awb = webui.apply_awb_gain()
+        row('  R',  f'{awb[0]:.3f}')
+        row('  G',  f'{awb[1]:.3f}')
+        row('  B',  f'{awb[3]:.3f}')
+        row('  Contrast', webui.get('contrast', 80))
+        onoff = 'ON' if AUTO_AWB else 'OFF'
+        img.draw_string(left_x, y - row_h - 2, f'  Auto AWB: {onoff}', scale=0.8, color=c_dim)
+
+        # Threshold
+        y += 4
+        img.draw_string(left_x, y, '-- Threshold --', scale=1.0, color=c_head)
+        y += row_h + 2
+        row('  Block', webui.get('adp_block', 27))
+        row('  C', webui.get('adp_c', 31))
+
+        # Filter
+        y += 4
+        img.draw_string(left_x, y, '-- Filter --', scale=1.0, color=c_head)
+        y += row_h + 2
+        row('  LPF alpha', f'{LPF_ALPHA:.2f}')
+        row('  KF pred dt', f'{webui.get("kf_dt", 0.05):.2f}', 's')
+        kf_q = webui.get('kf_q', 100000)
+        row('  KF Q', f'{kf_q:.0f}' if kf_q < 1000 else f'{kf_q/1000:.0f}k')
+
+        # Offset
+        y += 4
+        img.draw_string(left_x, y, '-- Offset --', scale=1.0, color=c_head)
+        y += row_h + 2
+        row('  X', webui.get('ofs_x', 0), 'px')
+        row('  Y', webui.get('ofs_y', 0), 'px')
+
+        # 帧率 + 提示
+        fps = time.fps()
+        img.draw_string(left_x, h - 22, f'FPS:{fps:.0f}', scale=1.0, color=c_dim)
+        tip = 'tap to toggle'
+        tw = image.string_size(tip, scale=0.7)[0]
+        img.draw_string(w - tw - 8, h - 18, tip, scale=0.7, color=c_dim)
+
+    def _check_touch(self):
+        """检测触摸, 切换参数界面"""
+        if self._ts is None:
+            return
+        try:
+            if self._ts.available():
+                state = self._ts.read()       # → [x, y, pressed]
+                pressed = state[2] if state else 0
+                if pressed:
+                    if not self._ts_touched:
+                        self._ts_touched = True
+                        self._show_params = not self._show_params
+                else:
+                    self._ts_touched = False
+        except Exception:
+            pass
+
+    def _display(self, img):
+        """统一的显示入口, 自动处理参数二级界面"""
+        if self._disp is None:
+            return
+        if self._show_params:
+            self._draw_params_screen(img)
+        self._disp.show(img, fit=image.Fit.FIT_CONTAIN)
 
     def _show(self, img):
         if self._disp is not None:
