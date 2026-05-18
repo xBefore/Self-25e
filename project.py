@@ -191,13 +191,19 @@ class VisualProcessor:
             self._cam.set_wb_gain(webui.apply_awb_gain())
         self._cam.constrast(webui.get('contrast', CONTRAST_DEF))
 
-        # 注册 ISP 回调: WebUI 改变 awb/contrast 时重新应用到摄像头
+        # 注册 ISP 回调: WebUI 改变 awb/contrast/exposure 时重新应用到摄像头
         def _on_isp_change(key, value):
             if key in ('awb_r', 'awb_g', 'awb_b'):
                 if not AUTO_AWB:
                     self._cam.set_wb_gain(webui.apply_awb_gain())
             elif key == 'contrast':
                 self._cam.constrast(value)
+            elif key == 'exposure':
+                if value > 0:
+                    self._cam.exp_mode(camera.AeMode.Manual)
+                    self._cam.exposure(int(value))
+                else:
+                    self._cam.exp_mode(camera.AeMode.Auto)
 
         webui.set_isp_callback(_on_isp_change)
 
@@ -336,14 +342,22 @@ class VisualProcessor:
         self.updated = True
         self._debug_time("error")
 
-        # 11. 触摸检测(切换参数界面)
+        # 11. 触摸检测 + 显示 (调参模式: 触摸/调试/参数屏; 竞赛模式: 全跳过)
         self._check_touch()
-
-        # 12. 显示
-        if not self._show_params:
-            img = self._draw_debug(img, img_ai, bbox, corners_cam,
-                                    center_cam, center_for_err, circle3_cam)
+        if webui.get('tuning_mode', True):
+            if not self._show_params:
+                img = self._draw_debug(img, img_ai, bbox, corners_cam,
+                                        center_cam, center_for_err, circle3_cam)
         self._display(img)
+
+        # 12. 推送给 WebUI 实时状态
+        webui.update_stats(
+            fps=time.fps(),
+            updated=self.updated,
+            err_x=self.err_center[0], err_y=self.err_center[1],
+            center_x=self.last_center[0] if self.last_center else 0,
+            center_y=self.last_center[1] if self.last_center else 0,
+        )
 
         return {
             "err_center":      self.err_center,
@@ -374,7 +388,7 @@ class VisualProcessor:
     def _detect_border(self, img):
         """YOLOv5检测黑框,返回(found, bbox, img_ai)"""
         img_ai = img.resize(self._ai_w, self._ai_h) if HIRES_MODE else img
-        objs = self._detector.detect(img_ai, conf_th=CONF_TH,
+        objs = self._detector.detect(img_ai, conf_th=webui.get('conf_th', CONF_TH),
                                      iou_th=IOU_TH, fit=image.Fit.FIT_CONTAIN)
         if not objs:
             return False, None, img_ai
@@ -456,7 +470,8 @@ class VisualProcessor:
         # 验证最小边长
         min_w = np.linalg.norm(ordered[1] - ordered[0])
         min_h = np.linalg.norm(ordered[3] - ordered[0])
-        if min_w < RECT_MIN_LIMIT or min_h < RECT_MIN_LIMIT:
+        rlim = webui.get('rect_min', RECT_MIN_LIMIT)
+        if min_w < rlim or min_h < rlim:
             return None
 
         return ordered
@@ -491,7 +506,7 @@ class VisualProcessor:
 
     def _gen_circle3(self, center_std, circle_dist):
         """在标准图空间生成第3圈(r=6cm)的轨迹点"""
-        radius = circle_dist * CIRCLE3_RING
+        radius = circle_dist * webui.get('circle_ring', CIRCLE3_RING)
         angles = np.linspace(0, 2 * np.pi, CIRCLE3_POINTS, endpoint=False)
         pts = np.zeros((1, CIRCLE3_POINTS, 2), dtype=np.float32)
         pts[0, :, 0] = center_std[0] + radius * np.cos(angles)
@@ -693,8 +708,20 @@ class VisualProcessor:
         row('  G',  f'{awb[1]:.3f}')
         row('  B',  f'{awb[3]:.3f}')
         row('  Contrast', webui.get('contrast', 80))
+        exp = webui.get('exposure', 0)
+        row('  Exposure', 'auto' if exp==0 else str(int(exp))+'us')
         onoff = 'ON' if AUTO_AWB else 'OFF'
-        img.draw_string(left_x, y - row_h - 2, f'  Auto AWB: {onoff}', scale=0.8, color=c_dim)
+        img.draw_string(left_x, y - row_h - 4, f'  Auto AWB: {onoff}', scale=0.8, color=c_dim)
+
+        # Detection
+        y += 4
+        img.draw_string(left_x, y, '-- Detection --', scale=1.0, color=c_head)
+        y += row_h + 2
+        row('  YOLO conf', f'{webui.get("conf_th", 0.5):.2f}')
+        row('  Rect min', webui.get('rect_min', 12))
+        ring = webui.get('circle_ring', 3)
+        ring_names = {0:'Bullseye', 1:'R1(2cm)', 2:'R2(4cm)', 3:'R3(6cm)', 4:'R4(8cm)'}
+        row('  Ring', ring_names.get(ring, f'R{ring}'))
 
         # Threshold
         y += 4
@@ -707,7 +734,7 @@ class VisualProcessor:
         y += 4
         img.draw_string(left_x, y, '-- Filter --', scale=1.0, color=c_head)
         y += row_h + 2
-        row('  LPF alpha', f'{LPF_ALPHA:.2f}')
+        row('  LPF alpha', f'{webui.get("lpf_alpha", LPF_ALPHA):.2f}')
         row('  KF pred dt', f'{webui.get("kf_dt", 0.05):.2f}', 's')
         kf_q = webui.get('kf_q', 100000)
         row('  KF Q', f'{kf_q:.0f}' if kf_q < 1000 else f'{kf_q/1000:.0f}k')
@@ -727,7 +754,9 @@ class VisualProcessor:
         img.draw_string(w - tw - 8, h - 18, tip, scale=0.7, color=c_dim)
 
     def _check_touch(self):
-        """检测触摸, 切换参数界面"""
+        """检测触摸, 切换参数界面。非调参模式下跳过"""
+        if not webui.get('tuning_mode', True):
+            return
         if self._ts is None:
             return
         try:
@@ -744,7 +773,9 @@ class VisualProcessor:
             pass
 
     def _display(self, img):
-        """统一的显示入口, 自动处理参数二级界面"""
+        """统一的显示入口, 自动处理参数二级界面。非调参模式下直接跳过"""
+        if not webui.get('tuning_mode', True):
+            return
         if self._disp is None:
             return
         if self._show_params:
@@ -788,12 +819,13 @@ class VisualProcessor:
 
     def _lpf_apply(self, err):
         """一阶低通 EMA: y = α*x + (1-α)*y_prev"""
-        if LPF_ALPHA <= 0 or LPF_ALPHA >= 1:
+        alpha = webui.get('lpf_alpha', LPF_ALPHA)
+        if alpha <= 0 or alpha >= 1:
             return err
         if self._lpf_err is None:
             self._lpf_err = err
             return err
-        a = LPF_ALPHA
+        a = alpha
         self._lpf_err = [a * err[0] + (1 - a) * self._lpf_err[0],
                          a * err[1] + (1 - a) * self._lpf_err[1]]
         return self._lpf_err
